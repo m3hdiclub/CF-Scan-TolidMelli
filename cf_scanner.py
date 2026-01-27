@@ -15,11 +15,17 @@ import ipaddress
 import json
 import sys
 import signal
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 import urllib.request
 import urllib.error
+
+# Windows performance optimization
+if sys.platform == 'win32':
+    # Use faster socket implementation on Windows
+    socket.setdefaulttimeout(5)
 
 
 class CloudflareScanner:
@@ -37,6 +43,12 @@ class CloudflareScanner:
         self.total_ips = 0
         self.output_file = config.get('output_file', 'working_ips')
         self.stop_scan = False  # Flag to stop scanning
+
+        # New optimization options
+        self.randomize = config.get('randomize', False)
+        self.random_ips_per_range = min(255, max(1, config.get('random_ips_per_range', 10)))
+        self.mix_ranges = config.get('mix_ranges', False)
+
 
     def save_ip_realtime(self, result: Dict):
         """Save a single working IP immediately to file"""
@@ -63,6 +75,8 @@ class CloudflareScanner:
             # Create socket and connect
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
+            # TCP optimization for faster connections
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             try:
                 sock.connect((ip, self.port))
@@ -140,6 +154,8 @@ class CloudflareScanner:
             # Create socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
+            # TCP optimization for faster connections
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             try:
                 # Connect
@@ -198,19 +214,82 @@ class CloudflareScanner:
 
         return result
 
-    def generate_ips_from_subnets(self, subnets: List[str]) -> List[str]:
-        """Generate list of IPs from subnet ranges"""
-        all_ips = []
+    def split_to_24_ranges(self, subnets: List[str]) -> List[ipaddress.IPv4Network]:
+        """Convert all subnets to /24 ranges and remove duplicates"""
+        ranges_24_set = set()  # Use set to track unique ranges
 
         for subnet in subnets:
             try:
                 network = ipaddress.ip_network(subnet, strict=False)
-                # Convert to list of IP strings
-                ips = [str(ip) for ip in network.hosts()]
-                all_ips.extend(ips)
-                print(f"Loaded {len(ips)} IPs from subnet {subnet}")
+                prefix = network.prefixlen
+
+                if prefix <= 24:
+                    # Split larger networks into /24s
+                    for subnet_24 in network.subnets(new_prefix=24):
+                        ranges_24_set.add(subnet_24)
+                else:
+                    # Smaller than /24, keep as is
+                    ranges_24_set.add(network)
+
             except ValueError as e:
                 print(f"Error parsing subnet {subnet}: {e}")
+
+        # Convert back to list
+        ranges_24 = list(ranges_24_set)
+        return ranges_24
+
+    def generate_ips_from_subnets(self, subnets: List[str]) -> List[str]:
+        """Generate list of IPs from subnet ranges with optimization options"""
+        all_ips = []
+
+        # Step 1: Convert all ranges to /24 and remove duplicates
+        print("Converting subnets to /24 ranges...")
+        ranges_24 = self.split_to_24_ranges(subnets)
+
+        # Calculate expected ranges without deduplication for comparison
+        expected_count = 0
+        for subnet in subnets:
+            try:
+                network = ipaddress.ip_network(subnet, strict=False)
+                if network.prefixlen <= 24:
+                    expected_count += 2 ** (24 - network.prefixlen)
+                else:
+                    expected_count += 1
+            except:
+                pass
+
+        duplicates_removed = expected_count - len(ranges_24)
+        print(f"Total /24 ranges: {len(ranges_24)}" + (f" ({duplicates_removed} duplicates removed)" if duplicates_removed > 0 else ""))
+
+        # Step 2: Mix ranges if enabled
+        if self.mix_ranges:
+            print("Shuffling /24 ranges...")
+            random.shuffle(ranges_24)
+
+        # Step 3: Generate IPs from each /24 range
+        for network in ranges_24:
+            try:
+                hosts = list(network.hosts())
+
+                if self.randomize:
+                    # Pick random IPs from this /24
+                    num_to_pick = min(self.random_ips_per_range, len(hosts))
+                    selected_hosts = random.sample(hosts, num_to_pick)
+                    ips = [str(ip) for ip in selected_hosts]
+                else:
+                    # Use all IPs
+                    ips = [str(ip) for ip in hosts]
+
+                all_ips.extend(ips)
+
+            except ValueError as e:
+                print(f"Error processing range {network}: {e}")
+
+        # Print summary
+        if self.randomize:
+            print(f"Randomize enabled: {self.random_ips_per_range} IPs per /24 range")
+        if self.mix_ranges:
+            print(f"Range mixing enabled")
 
         return all_ips
 
@@ -224,6 +303,8 @@ class CloudflareScanner:
         print(f"Max Workers: {self.max_workers}")
         print(f"Port: {self.port}")
         print(f"Download Test: {self.test_download}")
+        print(f"Randomize: {self.randomize}" + (f" ({self.random_ips_per_range} IPs per /24)" if self.randomize else ""))
+        print(f"Mix Ranges: {self.mix_ranges}")
         print(f"{'='*60}\n")
 
         # Generate all IPs
@@ -376,6 +457,9 @@ def main():
             'test_download': True,
             'download_size': 102400,
             'port': 443,
+            'randomize': False,
+            'random_ips_per_range': 10,
+            'mix_ranges': False,
             'subnets': [
                 '104.18.0.0/20',
                 '172.64.0.0/20'
